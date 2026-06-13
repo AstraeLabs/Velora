@@ -2,37 +2,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// HttpVersion
-// ---------------------------------------------------------------------------
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Hash, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum HttpVersion {
-    #[default]
-    Auto,
-    Http1,
-    Http2,
-    Http3,
-}
-
-impl HttpVersion {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HttpVersion::Auto  => "auto",
-            HttpVersion::Http1 => "http1",
-            HttpVersion::Http2 => "http2",
-            HttpVersion::Http3 => "http3",
-        }
-    }
-
-    pub fn is_http3_without_feature(&self) -> bool {
-        #[cfg(feature = "http3")]
-        { false }
-        #[cfg(not(feature = "http3"))]
-        { matches!(self, HttpVersion::Http3) }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // DownloadPlan
 // ---------------------------------------------------------------------------
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -52,9 +21,6 @@ pub struct DownloadPlan {
 
     #[serde(default)]
     pub display_label: Option<String>,
-
-    #[serde(default)]
-    pub output_dir: Option<String>,
 
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -80,17 +46,14 @@ pub struct DownloadPlan {
     #[serde(default)]
     pub proxy_url: Option<String>,
 
+    #[serde(default = "default_verify_tls")]
+    pub verify_tls: bool,
+
     #[serde(default)]
     pub headers: HashMap<String, String>,
 
     #[serde(default)]
     pub user_agent: Option<String>,
-
-    #[serde(default)]
-    pub max_speed_bytes: Option<u64>,
-
-    #[serde(default)]
-    pub http_version: HttpVersion,
 
     #[serde(default)]
     pub tasks: Vec<DownloadTask>,
@@ -169,5 +132,6 @@ fn default_concurrency()     -> usize  { 8 }
 fn default_retry_count()     -> u32    { 3 }
 fn default_timeout_seconds() -> u64    { 30 }
 fn default_max_redirects()   -> u32    { 10 }
+fn default_verify_tls()      -> bool   { true }
 fn default_retry_base_delay()-> f64    { 1.0 }
 fn default_retry_max_delay() -> f64    { 30.0 }

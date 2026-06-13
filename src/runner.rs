@@ -20,12 +20,13 @@ use reqwest::header::{
 use reqwest::{Client, Proxy, StatusCode};
 use serde_json::{json, Value};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::models::{DownloadPlan, DownloadTask, HttpVersion};
+use crate::models::{DownloadPlan, DownloadTask};
 use crate::speed::SpeedTracker;
 
 const DEFAULT_USER_AGENT: &str = "Velora/2";
+const WRITE_BUFFER_BYTES: usize = 256 * 1024;
 static STDOUT_PIPE_CLOSED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
@@ -36,7 +37,7 @@ pub struct ClientKey {
     pub timeout_seconds: u64,
     pub proxy_url: Option<String>,
     pub max_redirects: u32,
-    pub http_version: HttpVersion,
+    pub verify_tls: bool,
 }
 
 impl ClientKey {
@@ -45,7 +46,7 @@ impl ClientKey {
             timeout_seconds: plan.timeout_seconds.max(1),
             proxy_url: plan.proxy_url.clone(),
             max_redirects: plan.max_redirects.max(1),
-            http_version: plan.http_version.clone(),
+            verify_tls: plan.verify_tls,
         }
     }
 }
@@ -57,37 +58,12 @@ pub fn build_client(key: &ClientKey, pool_max_idle: usize) -> anyhow::Result<Cli
         .use_rustls_tls()
         .pool_max_idle_per_host(pool_max_idle.max(1))
         .redirect(reqwest::redirect::Policy::limited(key.max_redirects.max(1) as usize))
-        .no_gzip()
-        .no_deflate()
-        .no_brotli()
         .http2_adaptive_window(true)
         .http2_keep_alive_interval(std::time::Duration::from_secs(20))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10));
 
-    match &key.http_version {
-        HttpVersion::Auto => {
-        }
-        HttpVersion::Http1 => {
-            builder = builder.http1_only();
-        }
-        HttpVersion::Http2 => {
-            builder = builder.http2_prior_knowledge();
-        }
-        HttpVersion::Http3 => {
-            #[cfg(feature = "http3")]
-            {
-                builder = builder.http3_prior_knowledge();
-            }
-            #[cfg(not(feature = "http3"))]
-            {
-                write_warning(
-                    "client",
-                    "http_version",
-                    "http3",
-                    "HTTP/3 support is not enabled in this build, falling back to auto-negotiation",
-                );
-            }
-        }
+    if !key.verify_tls {
+        builder = builder.danger_accept_invalid_certs(true);
     }
 
     if let Some(ref proxy_url) = key.proxy_url {
@@ -254,10 +230,8 @@ impl DownloadRunner {
             "display_label": self.plan.display_label,
             "task_count": self.plan.tasks.len(),
             "concurrency": self.plan.concurrency,
-            "max_speed_bytes": self.plan.max_speed_bytes,
             "max_redirects": self.plan.max_redirects,
-            "http_version": self.plan.http_version.as_str(),
-            "http3_available": cfg!(feature = "http3"),
+            "verify_tls": self.plan.verify_tls,
         }));
 
         if self.plan.tasks.is_empty() {
@@ -298,10 +272,10 @@ impl DownloadRunner {
         let completed_bytes_for_tasks = completed_bytes.clone();
         let plan_headers_for_tasks = plan_headers.clone();
         let default_user_agent_for_tasks = default_user_agent.clone();
-        let task_items = plan_for_tasks.tasks.clone();
+        let task_count = plan_for_tasks.tasks.len();
 
-        stream::iter(task_items.into_iter().enumerate())
-            .for_each_concurrent(concurrency, move |(index, task)| {
+        stream::iter(0..task_count)
+            .for_each_concurrent(concurrency, move |index| {
                 let plan = plan_for_tasks.clone();
                 let client = client_for_tasks.clone();
                 let speed = speed_for_tasks.clone();
@@ -314,7 +288,7 @@ impl DownloadRunner {
 
                 async move {
                     run_one_task(
-                        &task,
+                        &plan.tasks[index],
                         index,
                         total,
                         &plan,
@@ -694,7 +668,7 @@ async fn try_download_once(
     }
 
     let append = resume_from > 0 && status == StatusCode::PARTIAL_CONTENT;
-    let mut file = if append {
+    let file = if append {
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -706,12 +680,10 @@ async fn try_download_once(
             .await
             .map_err(|e| AttemptError::fatal(format!("Create temp file failed: {e}")))?
     };
+    let mut file = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
 
     let mut stream = response.bytes_stream();
     let mut file_size = if append { resume_from } else { 0 };
-
-    let dl_start = Instant::now();
-    let max_bps = plan.max_speed_bytes;
 
     while let Some(chunk_result) = stream.next().await {
         if cancel_requested.load(Ordering::Relaxed) || is_stdout_pipe_closed() {
@@ -728,18 +700,6 @@ async fn try_download_once(
 
         file_size += len;
         speed.record(len);
-
-        if let Some(bps_cap) = max_bps {
-            if bps_cap > 0 {
-                let ideal_elapsed_ms = (file_size as f64 / bps_cap as f64 * 1_000.0) as u64;
-                let real_elapsed_ms = dl_start.elapsed().as_millis() as u64;
-
-                if ideal_elapsed_ms > real_elapsed_ms {
-                    let sleep_ms = ideal_elapsed_ms - real_elapsed_ms;
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                }
-            }
-        }
     }
 
     file.flush()
@@ -870,7 +830,7 @@ async fn promote_temp_to_final(temp_path: &Path, final_path: &Path) -> std::io::
 
         tokio::task::spawn_blocking(move || promote_temp_to_final_windows(&temp, &final_path))
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
     }
 
     #[cfg(not(windows))]
