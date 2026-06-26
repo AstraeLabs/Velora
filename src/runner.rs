@@ -690,8 +690,16 @@ async fn try_download_once(
             return Err(AttemptError::cancelled("Cancelled during transfer"));
         }
 
-        let chunk: Bytes = chunk_result
-            .map_err(|e| AttemptError::retryable(format!("Stream read failed: {e}")))?;
+        let chunk: Bytes = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                
+                // The body was truncated mid-transfer (premature EOF / chunk decode error). Discard the partial file before retrying
+                drop(file);
+                let _ = fs::remove_file(temp_path).await;
+                return Err(AttemptError::retryable(format!("Stream read failed: {e}")));
+            }
+        };
         let len = chunk.len() as u64;
 
         file.write_all(&chunk)
