@@ -56,11 +56,9 @@ pub fn build_client(key: &ClientKey, pool_max_idle: usize) -> anyhow::Result<Cli
         .timeout(std::time::Duration::from_secs(key.timeout_seconds))
         .connection_verbose(false)
         .use_rustls_tls()
+        .http1_only()
         .pool_max_idle_per_host(pool_max_idle.max(1))
-        .redirect(reqwest::redirect::Policy::limited(key.max_redirects.max(1) as usize))
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
-        .http2_keep_alive_timeout(std::time::Duration::from_secs(10));
+        .redirect(reqwest::redirect::Policy::limited(key.max_redirects.max(1) as usize));
 
     if !key.verify_tls {
         builder = builder.danger_accept_invalid_certs(true);
@@ -628,6 +626,11 @@ async fn try_download_once(
     }
 
     let mut resume_from = fs::metadata(temp_path).await.map(|m| m.len()).unwrap_or(0);
+    let task_has_range = task_headers.iter().any(|(name, _)| *name == RANGE);
+    if task_has_range && resume_from > 0 {
+        let _ = fs::remove_file(temp_path).await;
+        resume_from = 0;
+    }
 
     let mut req = client
         .get(&task.url)
@@ -641,6 +644,7 @@ async fn try_download_once(
 
     let response = req.send().await.map_err(|e| AttemptError::retryable(format!("Request failed: {e}")))?;
     let status = response.status();
+    let response_content_length = response.content_length();
 
     if resume_from > 0 && status == StatusCode::OK {
         // Server ignored Range and returned full content. Restart from zero.
@@ -715,10 +719,24 @@ async fn try_download_once(
         .map_err(|e| AttemptError::fatal(format!("Flush failed: {e}")))?;
 
     if file_size == 0 {
-        return Err(AttemptError::fatal(format!(
+        drop(file);
+        let _ = fs::remove_file(temp_path).await;
+        return Err(AttemptError::retryable(format!(
             "Downloaded file is empty: {}",
             task.url
         )));
+    }
+
+    if let Some(expected_body) = response_content_length {
+        let expected_total = if append { resume_from + expected_body } else { expected_body };
+        if file_size != expected_total {
+            drop(file);
+            let _ = fs::remove_file(temp_path).await;
+            return Err(AttemptError::retryable(format!(
+                "Incomplete download: got {file_size} bytes, expected {expected_total}: {}",
+                task.url
+            )));
+        }
     }
 
     Ok(file_size)
