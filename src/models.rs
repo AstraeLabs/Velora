@@ -44,6 +44,12 @@ pub struct DownloadPlan {
     pub retry_jitter_seconds: f64,
 
     #[serde(default)]
+    pub segment_delay_seconds: f64,
+
+    #[serde(default)]
+    pub segment_delay_jitter_seconds: f64,
+
+    #[serde(default)]
     pub proxy_url: Option<String>,
 
     #[serde(default = "default_verify_tls")]
@@ -88,6 +94,8 @@ impl DownloadPlan {
         self.retry_max_delay_seconds  =
             self.retry_max_delay_seconds.max(self.retry_base_delay_seconds);
         self.retry_jitter_seconds     = self.retry_jitter_seconds.max(0.0);
+        self.segment_delay_seconds        = self.segment_delay_seconds.max(0.0);
+        self.segment_delay_jitter_seconds = self.segment_delay_jitter_seconds.max(0.0);
 
         for task in &mut self.tasks {
             task.task_key.get_or_insert_with(|| self.task_key.clone());

@@ -495,6 +495,8 @@ async fn run_one_task(
         let _ = fs::create_dir_all(parent).await;
     }
 
+    maybe_segment_delay(plan, cancel_requested).await;
+
     let mut last_error = String::new();
 
     for attempt in 1..=plan.retry_count {
@@ -842,6 +844,36 @@ fn compute_retry_delay(attempt: u32, plan: &DownloadPlan) -> f64 {
         delay + rand::thread_rng().gen::<f64>() * plan.retry_jitter_seconds
     } else {
         delay
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delay per-segment pacing
+// ---------------------------------------------------------------------------
+async fn maybe_segment_delay(plan: &DownloadPlan, cancel_requested: &AtomicBool) {
+    if plan.segment_delay_seconds <= 0.0 && plan.segment_delay_jitter_seconds <= 0.0 {
+        return;
+    }
+
+    let jitter = if plan.segment_delay_jitter_seconds > 0.0 {
+        rand::thread_rng().gen::<f64>() * plan.segment_delay_jitter_seconds
+    } else {
+        0.0
+    };
+
+    let total = (plan.segment_delay_seconds + jitter).max(0.0);
+    if total <= 0.0 {
+        return;
+    }
+
+    let mut remaining = total;
+    while remaining > 0.0 {
+        if cancel_requested.load(Ordering::Relaxed) || is_stdout_pipe_closed() {
+            return;
+        }
+        let slice = remaining.min(0.25);
+        tokio::time::sleep(std::time::Duration::from_secs_f64(slice)).await;
+        remaining -= slice;
     }
 }
 
