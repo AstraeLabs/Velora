@@ -24,6 +24,10 @@ impl SpeedTracker {
         self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn bytes_per_second(&self) -> f64 {
         let now_ms = self.start.elapsed().as_millis() as u64;
         let total = self.total_bytes.load(Ordering::Relaxed);

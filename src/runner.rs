@@ -80,10 +80,10 @@ pub fn is_stdout_pipe_closed() -> bool {
 // ---------------------------------------------------------------------------
 pub fn format_size(bytes: i64) -> String {
     match bytes {
-        b if b >= 1_073_741_824 => format!("{:.2}GB", b as f64 / 1_073_741_824.0),
-        b if b >= 1_048_576 => format!("{:.1}MB", b as f64 / 1_048_576.0),
-        b if b >= 1_024 => format!("{:.0}KB", b as f64 / 1_024.0),
-        b => format!("{}B", b),
+        b if b >= 1_073_741_824 => format!("{:.2}G", b as f64 / 1_073_741_824.0),
+        b if b >= 1_048_576 => format!("{:.1}M", b as f64 / 1_048_576.0),
+        b if b >= 1_024 => format!("{:.0}K", b as f64 / 1_024.0),
+        b => format!("{}", b),
     }
 }
 
@@ -92,12 +92,12 @@ pub fn format_speed(bps: f64) -> String {
         return "---".into();
     }
     if bps >= 1_048_576.0 {
-        return format!("{:.2}MB/s", bps / 1_048_576.0);
+        return format!("{:.2}M/s", bps / 1_048_576.0);
     }
     if bps >= 1_024.0 {
-        return format!("{:.0}KB/s", bps / 1_024.0);
+        return format!("{:.0}K/s", bps / 1_024.0);
     }
-    format!("{:.0}B/s", bps)
+    format!("{:.0}/s", bps)
 }
 
 fn write_event(payload: Value) {
@@ -272,6 +272,38 @@ impl DownloadRunner {
         let default_user_agent_for_tasks = default_user_agent.clone();
         let task_count = plan_for_tasks.tasks.len();
 
+        let ticker_plan = plan_for_tasks.clone();
+        let ticker_speed = speed_for_tasks.clone();
+        let ticker_cancel = cancel_requested_for_tasks.clone();
+
+        // Emits a lightweight "progress" tick every ~300ms with the live cumulative byte count
+        let ticker_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // discard the immediate first tick
+
+            loop {
+                interval.tick().await;
+                if ticker_cancel.load(Ordering::Relaxed) || is_stdout_pipe_closed() {
+                    break;
+                }
+
+                let current_bytes = ticker_speed.total_bytes();
+                if current_bytes == 0 {
+                    continue;
+                }
+
+                write_event(json!({
+                    "event": "progress",
+                    "task_key": ticker_plan.task_key,
+                    "label": ticker_plan.label.as_deref(),
+                    "display_label": ticker_plan.display_label.as_deref(),
+                    "total_bytes": current_bytes,
+                    "speed": format_speed(ticker_speed.bytes_per_second()),
+                }));
+            }
+        });
+
         stream::iter(0..task_count)
             .for_each_concurrent(concurrency, move |index| {
                 let plan = plan_for_tasks.clone();
@@ -303,6 +335,8 @@ impl DownloadRunner {
                 }
             })
             .await;
+
+        ticker_handle.abort();
 
         let elapsed = start.elapsed().as_secs_f64().max(0.001);
         let done_bytes = completed_bytes.load(Ordering::Relaxed);
@@ -766,6 +800,10 @@ async fn register_completion(
     completed_count: &AtomicU32,
     completed_bytes: &AtomicI64,
 ) {
+    if skipped {
+        speed.record(bytes);
+    }
+
     if !skipped {
         completed_count.fetch_add(1, Ordering::Relaxed);
     }
