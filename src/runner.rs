@@ -56,6 +56,7 @@ pub fn build_client(key: &ClientKey, pool_max_idle: usize) -> anyhow::Result<Cli
         .timeout(std::time::Duration::from_secs(key.timeout_seconds))
         .connection_verbose(false)
         .use_rustls_tls()
+        .min_tls_version(reqwest::tls::Version::TLS_1_3)
         .http1_only()
         .pool_max_idle_per_host(pool_max_idle.max(1))
         .redirect(reqwest::redirect::Policy::limited(key.max_redirects.max(1) as usize));
