@@ -53,10 +53,9 @@ impl ClientKey {
 
 pub fn build_client(key: &ClientKey, pool_max_idle: usize) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
-        .timeout(std::time::Duration::from_secs(key.timeout_seconds))
+        .connect_timeout(std::time::Duration::from_secs(key.timeout_seconds))
         .connection_verbose(false)
         .use_rustls_tls()
-        .min_tls_version(reqwest::tls::Version::TLS_1_3)
         .http1_only()
         .pool_max_idle_per_host(pool_max_idle.max(1))
         .redirect(reqwest::redirect::Policy::limited(key.max_redirects.max(1) as usize));
@@ -669,9 +668,9 @@ async fn try_download_once(
         resume_from = 0;
     }
 
-    let mut req = client
-        .get(&task.url)
-        .timeout(std::time::Duration::from_secs(plan.timeout_seconds.max(1)));
+    let idle_timeout = std::time::Duration::from_secs(plan.timeout_seconds.max(1));
+
+    let mut req = client.get(&task.url);
 
     req = apply_headers(req, plan_headers, task_headers, default_user_agent);
 
@@ -726,15 +725,29 @@ async fn try_download_once(
     let mut stream = response.bytes_stream();
     let mut file_size = if append { resume_from } else { 0 };
 
-    while let Some(chunk_result) = stream.next().await {
+    loop {
         if cancel_requested.load(Ordering::Relaxed) || is_stdout_pipe_closed() {
             return Err(AttemptError::cancelled("Cancelled during transfer"));
         }
 
+        // Idle timeout: resets on every chunk, so a slow-but-progressing transfer
+        // (e.g. a throttled CDN) isn't killed by a fixed whole-request deadline.
+        let chunk_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                drop(file);
+                let _ = fs::remove_file(temp_path).await;
+                return Err(AttemptError::retryable(format!(
+                    "Stream stalled: no data received for {}s",
+                    idle_timeout.as_secs()
+                )));
+            }
+        };
+
         let chunk: Bytes = match chunk_result {
             Ok(chunk) => chunk,
             Err(e) => {
-                
                 // The body was truncated mid-transfer (premature EOF / chunk decode error). Discard the partial file before retrying
                 drop(file);
                 let _ = fs::remove_file(temp_path).await;
