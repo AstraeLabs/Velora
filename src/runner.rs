@@ -795,6 +795,7 @@ async fn try_download_once(
 fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::BAD_REQUEST
         || status.is_server_error()
 }
 

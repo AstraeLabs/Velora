@@ -58,6 +58,19 @@ jobs:
             asset_name: velora-linux-musl-x64
             cross:      true
 
+          # ── Android / Termux
+          - target:     aarch64-linux-android
+            os:         ubuntu-latest
+            artifact:   Velora
+            asset_name: velora-termux-arm64
+            cross:      true
+
+          - target:     armv7-linux-androideabi
+            os:         ubuntu-latest
+            artifact:   Velora
+            asset_name: velora-termux-arm
+            cross:      true
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
