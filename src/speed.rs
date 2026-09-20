@@ -28,6 +28,17 @@ impl SpeedTracker {
         self.total_bytes.load(Ordering::Relaxed)
     }
 
+    pub fn current_bps(&self) -> f64 {
+        let smooth = self.smoothed_bps.load(Ordering::Relaxed);
+        if smooth != 0 {
+            return smooth as f64;
+        }
+        average_bps(
+            self.total_bytes.load(Ordering::Relaxed),
+            self.start.elapsed().as_millis() as u64,
+        )
+    }
+
     pub fn bytes_per_second(&self) -> f64 {
         let now_ms = self.start.elapsed().as_millis() as u64;
         let total = self.total_bytes.load(Ordering::Relaxed);
@@ -65,5 +76,47 @@ fn average_bps(total_bytes: u64, elapsed_ms: u64) -> f64 {
         0.0
     } else {
         total_bytes as f64 / (elapsed_ms as f64 / 1_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_bps_does_not_disturb_bytes_per_second_sampling_window() {
+        let tracker = SpeedTracker::new();
+        tracker.record(1_000_000);
+
+        // Prime the windowed sampler once so it has a non-zero smoothed rate.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        tracker.record(1_000_000);
+        let _ = tracker.bytes_per_second();
+
+        let before = tracker.last_snapshot_bytes.load(Ordering::Relaxed);
+        let before_ms = tracker.last_snapshot_ms.load(Ordering::Relaxed);
+
+        // Many concurrent "current_bps" reads (simulating per-segment
+        // completion events) must not move the ticker's sampling baseline.
+        for _ in 0..50 {
+            let _ = tracker.current_bps();
+        }
+
+        assert_eq!(tracker.last_snapshot_bytes.load(Ordering::Relaxed), before);
+        assert_eq!(tracker.last_snapshot_ms.load(Ordering::Relaxed), before_ms);
+    }
+
+    #[test]
+    fn bytes_per_second_does_move_the_sampling_window() {
+        let tracker = SpeedTracker::new();
+        tracker.record(1_000_000);
+        let _ = tracker.bytes_per_second();
+        let before_ms = tracker.last_snapshot_ms.load(Ordering::Relaxed);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        tracker.record(1_000_000);
+        let _ = tracker.bytes_per_second();
+
+        assert_ne!(tracker.last_snapshot_ms.load(Ordering::Relaxed), before_ms);
     }
 }

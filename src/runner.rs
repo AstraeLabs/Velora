@@ -432,7 +432,7 @@ fn apply_headers(mut req: reqwest::RequestBuilder, plan_headers: &[(HeaderName, 
 #[allow(clippy::too_many_arguments)]
 async fn run_one_task(
     task: &DownloadTask,
-    _index: usize,
+    index: usize,
     total: usize,
     plan: &DownloadPlan,
     client: &Client,
@@ -467,7 +467,14 @@ async fn run_one_task(
     let (task_headers, _has_task_ua) = parse_headers(&task.headers, "task");
 
     let final_path = PathBuf::from(&task.path);
-    let temp_path = PathBuf::from(format!("{}.part", final_path.display()));
+    
+    // Unique per (process, task index) 
+    let temp_path = PathBuf::from(format!(
+        "{}.{}.{}.part",
+        final_path.display(),
+        std::process::id(),
+        index
+    ));
 
     // - if output exists and remote length is known and matches => skip
     // - if output exists and remote length says it's partial => resume from .part
@@ -505,22 +512,12 @@ async fn run_one_task(
                 Some(remote_len) if remote_len < meta.len() => {
                     let _ = fs::remove_file(&final_path).await;
                 }
-                _ => {
-                    register_completion(
-                        task,
-                        &final_path,
-                        meta.len(),
-                        total,
-                        true,
-                        task_start.elapsed().as_secs_f64(),
-                        plan,
-                        speed,
-                        completed_count,
-                        completed_bytes,
-                    )
-                    .await;
-                    return;
-                }
+                // Remote length couldn't be determined (HEAD failed, timed out,
+                // 405, ...). We can't verify the pre-existing file is actually
+                // complete, so don't just trust it — fall through into the
+                // normal attempt loop below, which re-downloads it fresh
+                // (promote_temp_to_final overwrites the stale final_path).
+                _ => {}
             }
         }
     }
@@ -736,8 +733,17 @@ async fn try_download_once(
             Ok(Some(result)) => result,
             Ok(None) => break,
             Err(_) => {
-                drop(file);
-                let _ = fs::remove_file(temp_path).await;
+                // Unlike a truncated/corrupt body, a stall leaves the bytes
+                // already written intact -- keep them (flushed) so the next
+                // attempt can resume via Range instead of re-downloading the
+                // whole segment/file from zero. Only drop the file if the
+                // stall happened before anything was ever written.
+                if file_size > 0 {
+                    let _ = file.flush().await;
+                } else {
+                    drop(file);
+                    let _ = fs::remove_file(temp_path).await;
+                }
                 return Err(AttemptError::retryable(format!(
                     "Stream stalled: no data received for {}s",
                     idle_timeout.as_secs()
@@ -793,10 +799,34 @@ async fn try_download_once(
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
+    // 400 is deliberately excluded: it signals a permanently malformed
+    // request (bad URL/header/query), not a transient CDN hiccup, so
+    // retrying it just burns retry_count attempts for a guaranteed failure.
     status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::BAD_REQUEST
         || status.is_server_error()
+}
+
+#[cfg(test)]
+mod is_retryable_status_tests {
+    use super::*;
+
+    #[test]
+    fn retries_timeouts_rate_limits_and_server_errors() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn does_not_retry_bad_request_or_other_client_errors() {
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,10 +845,9 @@ async fn register_completion(
     completed_count: &AtomicU32,
     completed_bytes: &AtomicI64,
 ) {
-    if skipped {
-        speed.record(bytes);
-    }
-
+    // A skipped (already-downloaded) file isn't network throughput -- don't
+    // feed its whole size into the speed tracker in one shot, that produces
+    // a bogus instantaneous spike unrelated to actual transfer rate.
     if !skipped {
         completed_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -848,7 +877,7 @@ async fn register_completion(
             format_size(cb)
         },
         "final_size": format_size(bytes as i64),
-        "speed": format_speed(speed.bytes_per_second()),
+        "speed": format_speed(speed.current_bps()),
         "path": final_path,
         "url": task.url,
         "bytes": bytes,
