@@ -98,6 +98,8 @@ jobs:
       - name: Build (cross)
         if: matrix.cross == true
         shell: bash
+        env:
+          ANDROID_NDK_HOME: /android-ndk
         run: |
           cross build --release --target ${{ matrix.target }}
 
