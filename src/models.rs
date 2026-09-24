@@ -55,6 +55,9 @@ pub struct DownloadPlan {
     #[serde(default = "default_verify_tls")]
     pub verify_tls: bool,
 
+    #[serde(default = "default_http_version")]
+    pub http_version: String,
+
     #[serde(default)]
     pub headers: HashMap<String, String>,
 
@@ -96,6 +99,11 @@ impl DownloadPlan {
         self.retry_jitter_seconds     = self.retry_jitter_seconds.max(0.0);
         self.segment_delay_seconds        = self.segment_delay_seconds.max(0.0);
         self.segment_delay_jitter_seconds = self.segment_delay_jitter_seconds.max(0.0);
+        self.http_version = match self.http_version.trim() {
+            "2" | "2.0" | "h2" | "http2" => "2".into(),
+            "3" | "3.0" | "h3" | "http3" => "3".into(),
+            _ => "1.1".into(),
+        };
 
         for task in &mut self.tasks {
             task.task_key.get_or_insert_with(|| self.task_key.clone());
@@ -143,3 +151,4 @@ fn default_max_redirects()   -> u32    { 10 }
 fn default_verify_tls()      -> bool   { true }
 fn default_retry_base_delay()-> f64    { 1.0 }
 fn default_retry_max_delay() -> f64    { 30.0 }
+fn default_http_version()    -> String { "1.1".into() }

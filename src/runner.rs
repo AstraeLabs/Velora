@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::stream;
 use futures::StreamExt;
 use rand::Rng;
-use reqwest::header::{
+use wreq::header::{
     HeaderName,
     HeaderValue,
     ACCEPT_ENCODING,
@@ -17,7 +17,8 @@ use reqwest::header::{
     RANGE,
     USER_AGENT,
 };
-use reqwest::{Client, Proxy, StatusCode};
+use wreq::{Client, Proxy, StatusCode};
+use wreq_util::Emulation;
 use serde_json::{json, Value};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -38,6 +39,7 @@ pub struct ClientKey {
     pub proxy_url: Option<String>,
     pub max_redirects: u32,
     pub verify_tls: bool,
+    pub http_version: String,
 }
 
 impl ClientKey {
@@ -47,6 +49,7 @@ impl ClientKey {
             proxy_url: plan.proxy_url.clone(),
             max_redirects: plan.max_redirects.max(1),
             verify_tls: plan.verify_tls,
+            http_version: plan.http_version.clone(),
         }
     }
 }
@@ -55,13 +58,16 @@ pub fn build_client(key: &ClientKey, pool_max_idle: usize) -> anyhow::Result<Cli
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(key.timeout_seconds))
         .connection_verbose(false)
-        .use_rustls_tls()
-        .http1_only()
+        .emulation(Emulation::Chrome137)
         .pool_max_idle_per_host(pool_max_idle.max(1))
-        .redirect(reqwest::redirect::Policy::limited(key.max_redirects.max(1) as usize));
+        .redirect(wreq::redirect::Policy::limited(key.max_redirects.max(1) as usize));
+
+    if key.http_version == "1.1" {
+        builder = builder.http1_only();
+    }
 
     if !key.verify_tls {
-        builder = builder.danger_accept_invalid_certs(true);
+        builder = builder.tls_cert_verification(false);
     }
 
     if let Some(ref proxy_url) = key.proxy_url {
@@ -391,7 +397,7 @@ fn parse_headers(headers: &HashMap<String, String>, scope: &str) -> (Vec<(Header
     (parsed, has_user_agent)
 }
 
-fn apply_headers(mut req: reqwest::RequestBuilder, plan_headers: &[(HeaderName, HeaderValue)], task_headers: &[(HeaderName, HeaderValue)], default_user_agent: &HeaderValue) -> reqwest::RequestBuilder {
+fn apply_headers(mut req: wreq::RequestBuilder, plan_headers: &[(HeaderName, HeaderValue)], task_headers: &[(HeaderName, HeaderValue)], default_user_agent: &HeaderValue) -> wreq::RequestBuilder {
     let mut has_ua = false;
     let mut has_accept_encoding = false;
 
@@ -467,17 +473,12 @@ async fn run_one_task(
     let (task_headers, _has_task_ua) = parse_headers(&task.headers, "task");
 
     let final_path = PathBuf::from(&task.path);
-    
-    // Unique per (process, task index) 
-    let temp_path = PathBuf::from(format!(
-        "{}.{}.{}.part",
-        final_path.display(),
-        std::process::id(),
-        index
-    ));
+    let _ = index;
+    let temp_path = PathBuf::from(format!("{}.part", final_path.display()));
 
     // - if output exists and remote length is known and matches => skip
-    // - if output exists and remote length says it's partial => resume from .part
+    // - if output exists and remote length says it doesn't match => the file is
+    //   NOT trustworthy as a resume base (see below) => delete and redownload fresh
     if let Ok(meta) = fs::metadata(&final_path).await {
         if meta.len() > 0 && fs::metadata(&temp_path).await.is_err() {
             match probe_remote_content_length(
@@ -506,10 +507,20 @@ async fn run_one_task(
                     .await;
                     return;
                 }
-                Some(remote_len) if remote_len > meta.len() => {
-                    let _ = fs::rename(&final_path, &temp_path).await;
-                }
-                Some(remote_len) if remote_len < meta.len() => {
+                Some(remote_len) if remote_len != meta.len() => {
+                    // Do NOT rename-and-resume here: a size mismatch only tells us
+                    // final_path isn't the plain, complete remote body anymore -- it
+                    // says nothing about whether its existing bytes are still a valid
+                    // *prefix* of that body. In practice they often aren't: a
+                    // downstream consumer (e.g. VibraVid's in-place segment decrypt)
+                    // may have rewritten final_path after Velora produced it, so its
+                    // length here reflects post-processed content, not a partial
+                    // download. Resuming via Range on top of that appends fresh
+                    // remote bytes onto unrelated old bytes, and the concatenation's
+                    // length can coincidentally still match remote_len, sailing
+                    // through the Content-Length check below as silently corrupt
+                    // "completed" output. Deleting and redownloading whole is the
+                    // only way to guarantee final_path is exactly the remote body.
                     let _ = fs::remove_file(&final_path).await;
                 }
                 // Remote length couldn't be determined (HEAD failed, timed out,
@@ -965,12 +976,21 @@ async fn maybe_segment_delay(plan: &DownloadPlan, cancel_requested: &AtomicBool)
 async fn promote_temp_to_final(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let temp = temp_path.to_path_buf();
-        let final_path = final_path.to_path_buf();
-
-        tokio::task::spawn_blocking(move || promote_temp_to_final_windows(&temp, &final_path))
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?
+        let mut attempt = 0u32;
+        loop {
+            let temp = temp_path.to_path_buf();
+            let dest = final_path.to_path_buf();
+            let res = tokio::task::spawn_blocking(move || promote_temp_to_final_windows(&temp, &dest))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            match res {
+                Err(e) if attempt < 20 && matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33)) => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     #[cfg(not(windows))]
