@@ -33,25 +33,27 @@ jobs:
             os:         macos-latest
             artifact:   Velora
             asset_name: velora-osx-x64
+            macos_deployment_target: "10.13"
 
           - target:     aarch64-apple-darwin
             os:         macos-latest
             artifact:   Velora
             asset_name: velora-osx-arm64
 
-          # ── Linux (glibc – dynamically linked)
-          - target:     x86_64-unknown-linux-gnu
+          # ── Linux (musl – fully static, works on any glibc/musl version)
+          - target:     x86_64-unknown-linux-musl
             os:         ubuntu-latest
             artifact:   Velora
             asset_name: velora-linux-x64
+            cross:      true
 
-          - target:     aarch64-unknown-linux-gnu
+          - target:     aarch64-unknown-linux-musl
             os:         ubuntu-latest
             artifact:   Velora
             asset_name: velora-linux-arm64
-            cross:      true 
+            cross:      true
 
-          # ── Linux (musl – fully static binary)
+          # ── Linux (musl – fully static binary, duplicate asset name kept for compatibility)
           - target:     x86_64-unknown-linux-musl
             os:         ubuntu-latest
             artifact:   Velora
@@ -89,9 +91,16 @@ jobs:
         if: matrix.cross == true
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Install NASM (Windows BoringSSL build)
+        if: contains(matrix.target, 'windows-msvc')
+        run: choco install nasm -y
+
       - name: Build (cargo)
         if: matrix.cross != true
         shell: bash
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: |
           cargo build --release --target ${{ matrix.target }}
 
