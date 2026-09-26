@@ -100,8 +100,10 @@ jobs:
         shell: bash
         env:
           RUSTFLAGS: ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: |
+          if [ -n "${{ matrix.macos_deployment_target }}" ]; then
+            export MACOSX_DEPLOYMENT_TARGET="${{ matrix.macos_deployment_target }}"
+          fi
           cargo build --release --target ${{ matrix.target }}
 
       - name: Build (cross)
