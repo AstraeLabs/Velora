@@ -1,5 +1,30 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+pub struct RateLimiter {
+    bytes_per_sec: f64,
+    next_free: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    /// `None` when `bytes_per_sec` is 0 (unlimited).
+    pub fn new(bytes_per_sec: u64) -> Option<Self> {
+        (bytes_per_sec > 0).then(|| Self {
+            bytes_per_sec: bytes_per_sec as f64,
+            next_free: Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Books `bytes` on the timeline and returns how long the caller must wait before using them.
+    pub fn reserve(&self, bytes: u64) -> Duration {
+        let now = Instant::now();
+        let mut next = self.next_free.lock().unwrap_or_else(|e| e.into_inner());
+        let start = (*next).max(now);
+        *next = start + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec);
+        start.saturating_duration_since(now)
+    }
+}
 
 pub struct SpeedTracker {
     start: Instant,
@@ -104,6 +129,33 @@ mod tests {
 
         assert_eq!(tracker.last_snapshot_bytes.load(Ordering::Relaxed), before);
         assert_eq!(tracker.last_snapshot_ms.load(Ordering::Relaxed), before_ms);
+    }
+
+    #[test]
+    fn rate_limiter_is_off_for_zero() {
+        assert!(RateLimiter::new(0).is_none());
+    }
+
+    #[test]
+    fn rate_limiter_paces_consecutive_reservations() {
+        let limiter = RateLimiter::new(1_000_000).unwrap();
+
+        // First chunk is free; the next ones queue behind it at 1 MB/s.
+        assert!(limiter.reserve(500_000) < Duration::from_millis(50));
+        let second = limiter.reserve(500_000);
+        assert!(second > Duration::from_millis(400) && second < Duration::from_millis(600), "{second:?}");
+        let third = limiter.reserve(500_000);
+        assert!(third > Duration::from_millis(900) && third < Duration::from_millis(1100), "{third:?}");
+    }
+
+    #[test]
+    fn rate_limiter_does_not_bank_idle_time() {
+        let limiter = RateLimiter::new(1_000_000).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        // 200 ms idle must not allow a burst: two 500 KB chunks still take ~0.5 s apart.
+        let _ = limiter.reserve(500_000);
+        assert!(limiter.reserve(500_000) > Duration::from_millis(400));
     }
 
     #[test]

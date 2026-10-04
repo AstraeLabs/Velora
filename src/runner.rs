@@ -24,10 +24,11 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::models::{DownloadPlan, DownloadTask};
-use crate::speed::SpeedTracker;
+use crate::speed::{RateLimiter, SpeedTracker};
 
 const DEFAULT_USER_AGENT: &str = "Velora/2";
 const WRITE_BUFFER_BYTES: usize = 256 * 1024;
+const MIN_THROTTLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
 static STDOUT_PIPE_CLOSED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,7 @@ pub struct DownloadRunner {
     plan: DownloadPlan,
     client: Arc<Client>,
     speed: Arc<SpeedTracker>,
+    limiter: Option<Arc<RateLimiter>>,
     cancel_requested: Arc<AtomicBool>,
 
     plan_headers: Vec<(HeaderName, HeaderValue)>,
@@ -212,10 +214,13 @@ impl DownloadRunner {
         )
         .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_USER_AGENT));
 
+        let limiter = RateLimiter::new(plan.max_speed_bytes_per_sec).map(Arc::new);
+
         Self {
             plan,
             client,
             speed: Arc::new(SpeedTracker::new()),
+            limiter,
             cancel_requested,
             plan_headers,
             default_user_agent,
@@ -236,6 +241,7 @@ impl DownloadRunner {
             "concurrency": self.plan.concurrency,
             "max_redirects": self.plan.max_redirects,
             "verify_tls": self.plan.verify_tls,
+            "max_speed_bytes_per_sec": self.plan.max_speed_bytes_per_sec,
         }));
 
         if self.plan.tasks.is_empty() {
@@ -259,6 +265,7 @@ impl DownloadRunner {
         let plan = Arc::new(self.plan);
         let client = self.client.clone();
         let speed = self.speed.clone();
+        let limiter = self.limiter.clone();
         let cancel_requested = self.cancel_requested.clone();
         let completed_count = self.completed_count.clone();
         let failed_count = self.failed_count.clone();
@@ -270,6 +277,7 @@ impl DownloadRunner {
         let plan_for_tasks = plan.clone();
         let client_for_tasks = client.clone();
         let speed_for_tasks = speed.clone();
+        let limiter_for_tasks = limiter.clone();
         let cancel_requested_for_tasks = cancel_requested.clone();
         let completed_count_for_tasks = completed_count.clone();
         let failed_count_for_tasks = failed_count.clone();
@@ -315,6 +323,7 @@ impl DownloadRunner {
                 let plan = plan_for_tasks.clone();
                 let client = client_for_tasks.clone();
                 let speed = speed_for_tasks.clone();
+                let limiter = limiter_for_tasks.clone();
                 let cancel_requested = cancel_requested_for_tasks.clone();
                 let completed_count = completed_count_for_tasks.clone();
                 let failed_count = failed_count_for_tasks.clone();
@@ -330,6 +339,7 @@ impl DownloadRunner {
                         &plan,
                         &client,
                         &speed,
+                        limiter.as_deref(),
                         &plan_headers,
                         &default_user_agent,
                         &cancel_requested,
@@ -443,6 +453,7 @@ async fn run_one_task(
     plan: &DownloadPlan,
     client: &Client,
     speed: &SpeedTracker,
+    limiter: Option<&RateLimiter>,
     plan_headers: &[(HeaderName, HeaderValue)],
     default_user_agent: &HeaderValue,
     cancel_requested: &AtomicBool,
@@ -553,6 +564,7 @@ async fn run_one_task(
             plan,
             client,
             speed,
+            limiter,
             plan_headers,
             &task_headers,
             default_user_agent,
@@ -660,6 +672,7 @@ async fn try_download_once(
     plan: &DownloadPlan,
     client: &Client,
     speed: &SpeedTracker,
+    limiter: Option<&RateLimiter>,
     plan_headers: &[(HeaderName, HeaderValue)],
     task_headers: &[(HeaderName, HeaderValue)],
     default_user_agent: &HeaderValue,
@@ -779,6 +792,13 @@ async fn try_download_once(
 
         file_size += len;
         speed.record(len);
+
+        if let Some(limiter) = limiter {
+            let wait = limiter.reserve(len);
+            if wait >= MIN_THROTTLE_SLEEP {
+                sleep_unless_cancelled(wait, cancel_requested).await;
+            }
+        }
     }
 
     file.flush()
@@ -807,6 +827,19 @@ async fn try_download_once(
     }
 
     Ok(file_size)
+}
+
+async fn sleep_unless_cancelled(total: std::time::Duration, cancel_requested: &AtomicBool) {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+    let deadline = Instant::now() + total;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || cancel_requested.load(Ordering::Relaxed) || is_stdout_pipe_closed() {
+            return;
+        }
+        tokio::time::sleep(remaining.min(SLICE)).await;
+    }
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {

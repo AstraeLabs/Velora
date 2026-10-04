@@ -48,6 +48,9 @@ pub struct DownloadPlan {
 
     #[serde(default)]
     pub segment_delay_jitter_seconds: f64,
+    
+    #[serde(default)]
+    pub max_speed_bytes_per_sec: u64,
 
     #[serde(default)]
     pub proxy_url: Option<String>,
