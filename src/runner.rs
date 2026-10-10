@@ -45,6 +45,9 @@ pub struct ClientKey {
 
 impl ClientKey {
     pub fn from_plan(plan: &DownloadPlan) -> Self {
+        if !plan.verify_tls {
+            write_warning("plan", "verify_tls", "false", "TLS certificate verification is DISABLED");
+        }
         Self {
             timeout_seconds: plan.timeout_seconds.max(1),
             proxy_url: plan.proxy_url.clone(),
@@ -815,7 +818,7 @@ async fn try_download_once(
     }
 
     if let Some(expected_body) = response_content_length {
-        let expected_total = if append { resume_from + expected_body } else { expected_body };
+        let expected_total = if append { resume_from.saturating_add(expected_body) } else { expected_body };
         if file_size != expected_total {
             drop(file);
             let _ = fs::remove_file(temp_path).await;
@@ -896,7 +899,7 @@ async fn register_completion(
         completed_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    completed_bytes.fetch_add(bytes as i64, Ordering::Relaxed);
+    completed_bytes.fetch_add(i64::try_from(bytes).unwrap_or(i64::MAX), Ordering::Relaxed);
 
     let done = completed_count.load(Ordering::Relaxed);
     let cb = completed_bytes.load(Ordering::Relaxed);

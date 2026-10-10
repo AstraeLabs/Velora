@@ -92,16 +92,16 @@ impl DownloadPlan {
             .get_or_insert_with(|| label.clone())
             .clone();
 
-        self.concurrency              = self.concurrency.max(1);
-        self.retry_count              = self.retry_count.max(1);
-        self.timeout_seconds          = self.timeout_seconds.max(1);
-        self.max_redirects            = self.max_redirects.max(1);
-        self.retry_base_delay_seconds = self.retry_base_delay_seconds.max(0.0);
+        self.concurrency              = self.concurrency.clamp(1, MAX_CONCURRENCY);
+        self.retry_count              = self.retry_count.clamp(1, MAX_RETRY_COUNT);
+        self.timeout_seconds          = self.timeout_seconds.clamp(1, MAX_SECONDS as u64);
+        self.max_redirects            = self.max_redirects.clamp(1, MAX_REDIRECTS);
+        self.retry_base_delay_seconds = clamp_seconds(self.retry_base_delay_seconds);
         self.retry_max_delay_seconds  =
-            self.retry_max_delay_seconds.max(self.retry_base_delay_seconds);
-        self.retry_jitter_seconds     = self.retry_jitter_seconds.max(0.0);
-        self.segment_delay_seconds        = self.segment_delay_seconds.max(0.0);
-        self.segment_delay_jitter_seconds = self.segment_delay_jitter_seconds.max(0.0);
+            clamp_seconds(self.retry_max_delay_seconds).max(self.retry_base_delay_seconds);
+        self.retry_jitter_seconds     = clamp_seconds(self.retry_jitter_seconds);
+        self.segment_delay_seconds        = clamp_seconds(self.segment_delay_seconds);
+        self.segment_delay_jitter_seconds = clamp_seconds(self.segment_delay_jitter_seconds);
         self.http_version = match self.http_version.trim() {
             "2" | "2.0" | "h2" | "http2" => "2".into(),
             "3" | "3.0" | "h3" | "http3" => "3".into(),
@@ -139,6 +139,18 @@ pub struct DownloadTask {
 
     #[serde(default)]
     pub headers: HashMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENCY: usize = 256;
+const MAX_RETRY_COUNT: u32 = 100;
+const MAX_REDIRECTS: u32 = 50;
+const MAX_SECONDS: f64 = 3600.0;
+
+fn clamp_seconds(v: f64) -> f64 {
+    if v.is_finite() { v.clamp(0.0, MAX_SECONDS) } else { 0.0 }
 }
 
 // ---------------------------------------------------------------------------

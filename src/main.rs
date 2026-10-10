@@ -205,9 +205,31 @@ fn validate_plan(plan: &DownloadPlan) -> anyhow::Result<()> {
         if task.path.trim().is_empty() {
             return Err(anyhow::anyhow!("Task #{task_idx} has empty path"));
         }
+        if !has_allowed_scheme(&task.url, &["http", "https"]) {
+            return Err(anyhow::anyhow!("Task #{task_idx} url must use http or https"));
+        }
+        if std::path::Path::new(&task.path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(anyhow::anyhow!("Task #{task_idx} path must not contain '..'"));
+        }
+    }
+
+    if let Some(proxy) = plan.proxy_url.as_deref().filter(|p| !p.trim().is_empty()) {
+        if !has_allowed_scheme(proxy, &["http", "https", "socks5", "socks5h"]) {
+            return Err(anyhow::anyhow!("proxy_url must use http, https, socks5 or socks5h"));
+        }
     }
 
     Ok(())
+}
+
+fn has_allowed_scheme(url: &str, allowed: &[&str]) -> bool {
+    match url.trim().split_once("://") {
+        Some((scheme, _)) => allowed.iter().any(|a| scheme.eq_ignore_ascii_case(a)),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
