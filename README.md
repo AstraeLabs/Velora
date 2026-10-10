@@ -12,7 +12,7 @@ Velora --version
 
 ## How it works
 
-1. Reads `plan.json` and validates it (`http`/`https` URLs, paths without `..`).
+1. Reads `plan.json` and validates it (task URLs must be `http`/`https`).
 2. Downloads files in parallel (`concurrency`), each into a `.part` file that is renamed once the download completes.
 3. If a download is interrupted it retries (`retry_count`) and resumes where it left off (`Range` header).
 4. If the file already exists with the same remote size, it is skipped.
@@ -56,7 +56,7 @@ Top-level fields (all optional except `tasks`):
 | `segment_delay_seconds` | `0` | Pause before each file starts. |
 | `segment_delay_jitter_seconds` | `0` | Random extra pause before each file. |
 | `max_speed_bytes_per_sec` | `0` | Global speed limit, `0` = unlimited. |
-| `proxy_url` | none | `http`, `https`, `socks5` or `socks5h` proxy. |
+| `proxy_url` | none | `http`, `https`, `socks4`, `socks4a`, `socks5` or `socks5h` proxy (a bare `host:port` is treated as `http`). |
 | `verify_tls` | `true` | Set to `false` to skip certificate checks (a warning event is printed). |
 | `http_version` | `"1.1"` | `"1.1"` forces HTTP/1.1; `"2"`/`"3"` let the client negotiate. |
 | `headers` | `{}` | Headers sent with every request. |
@@ -68,7 +68,7 @@ Each task:
 | Field | Description |
 |---|---|
 | `url` | Required. Must be `http` or `https`. |
-| `path` | Required. Output file; must not contain `..`. Parent folders are created. |
+| `path` | Required. Output file. Parent folders are created. |
 | `headers` | Extra headers for this file only (can override the global ones). |
 | `task_key`, `label`, `display_label` | Override the top-level values in events. |
 

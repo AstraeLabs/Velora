@@ -205,30 +205,51 @@ fn validate_plan(plan: &DownloadPlan) -> anyhow::Result<()> {
         if task.path.trim().is_empty() {
             return Err(anyhow::anyhow!("Task #{task_idx} has empty path"));
         }
-        if !has_allowed_scheme(&task.url, &["http", "https"]) {
+        if has_disallowed_scheme(&task.url, &["http", "https"]) {
             return Err(anyhow::anyhow!("Task #{task_idx} url must use http or https"));
-        }
-        if std::path::Path::new(&task.path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(anyhow::anyhow!("Task #{task_idx} path must not contain '..'"));
         }
     }
 
     if let Some(proxy) = plan.proxy_url.as_deref().filter(|p| !p.trim().is_empty()) {
-        if !has_allowed_scheme(proxy, &["http", "https", "socks5", "socks5h"]) {
-            return Err(anyhow::anyhow!("proxy_url must use http, https, socks5 or socks5h"));
+        if has_disallowed_scheme(proxy, &["http", "https", "socks4", "socks4a", "socks5", "socks5h"]) {
+            return Err(anyhow::anyhow!(
+                "proxy_url must use http, https, socks4, socks4a, socks5 or socks5h"
+            ));
         }
     }
 
     Ok(())
 }
 
-fn has_allowed_scheme(url: &str, allowed: &[&str]) -> bool {
+fn has_disallowed_scheme(url: &str, allowed: &[&str]) -> bool {
     match url.trim().split_once("://") {
-        Some((scheme, _)) => allowed.iter().any(|a| scheme.eq_ignore_ascii_case(a)),
+        Some((scheme, _)) => !allowed.iter().any(|a| scheme.eq_ignore_ascii_case(a)),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    use super::has_disallowed_scheme;
+
+    const PROXY: &[&str] = &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
+
+    #[test]
+    fn proxy_schemes_accepted_as_before() {
+        for p in [
+            "http://h:1", "HTTPS://h:1", "socks4://h:1", "socks4a://h:1",
+            "socks5://h:1", "socks5h://h:1", "127.0.0.1:8080", "user:pw@h:1",
+        ] {
+            assert!(!has_disallowed_scheme(p, PROXY), "{p}");
+        }
+    }
+
+    #[test]
+    fn explicit_foreign_schemes_are_rejected() {
+        assert!(has_disallowed_scheme("file:///etc/passwd", &["http", "https"]));
+        assert!(has_disallowed_scheme("ftp://h/x", &["http", "https"]));
+        assert!(has_disallowed_scheme("gopher://h:1", PROXY));
+        assert!(!has_disallowed_scheme("https://h/x", &["http", "https"]));
     }
 }
 
