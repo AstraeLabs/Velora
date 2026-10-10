@@ -89,7 +89,9 @@ jobs:
 
       - name: Install cross
         if: matrix.cross == true
-        run: cargo install cross --locked --version 0.2.5
+        # cross 0.2.5's Android images (NDK r21) lack the CMake toolchain file that btls-sys
+        # needs; current main uses NDK r25. Pinned to a commit so the tool itself stays reproducible.
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 74e99b2223de06166f8cdcc1af7f1308ec52baf4 --locked
 
       - name: Install NASM (Windows BoringSSL build)
         if: contains(matrix.target, 'windows-msvc')
